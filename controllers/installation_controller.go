@@ -9,6 +9,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +34,7 @@ type InstallationReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=create;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -48,7 +50,9 @@ func (r *InstallationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	inst := &porterv1.Installation{}
 	err := r.Get(ctx, req.NamespacedName, inst)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "could not find bundle installation %s/%s", req.Namespace, req.Name)
+		// TODO: cleanup deleted installations
+		r.Log.Info("Installation has been deleted", "installation %s/%s", req.Namespace, req.Name)
+		return ctrl.Result{Requeue: false}, nil
 	}
 
 	// Retrieve the Job running the porter action
@@ -81,10 +85,42 @@ func (r *InstallationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, name string, inst *porterv1.Installation) error {
-	r.Log.Info(fmt.Sprintf("creating porter job %s/%s for Installation %s/%s", inst.Namespace, name, inst.Namespace, inst.Name))
+func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, jobName string, inst *porterv1.Installation) error {
+	r.Log.Info(fmt.Sprintf("creating porter job %s/%s for Installation %s/%s", inst.Namespace, jobName, inst.Namespace, inst.Name))
+
+	// Create a volume to store bundle outputs
+	outputsReq, err := r.getOutputsVolumeSize(ctx, inst)
+	if err != nil {
+		return err
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: inst.Namespace,
+			Labels: map[string]string{
+				"porter":       "true",
+				"installation": inst.Name,
+				"job":          jobName,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceStorage: outputsReq,
+				},
+			},
+		},
+	}
+	err = r.Create(ctx, pvc)
+	if err != nil {
+		return err
+	}
 
 	porterVersion, pullPolicy := r.getPorterImageVersion(ctx, inst)
+	img := "ghcr.io/getporter/porter:kubernetes-" + porterVersion
+	r.Log.Info("Using " + img)
 	serviceAccount := r.getPorterAgentServiceAccount(ctx, inst)
 
 	// porter ACTION INSTALLATION_NAME --tag=REFERENCE --debug
@@ -106,7 +142,7 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, n
 
 	porterJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
+			Name:      jobName,
 			Namespace: inst.Namespace,
 			Labels: map[string]string{
 				"porter":       "true",
@@ -118,7 +154,7 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, n
 			BackoffLimit: pointer.Int32Ptr(0),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: name,
+					GenerateName: jobName,
 					Namespace:    inst.Namespace,
 					Labels: map[string]string{
 						"porter":       "true",
@@ -148,8 +184,8 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, n
 					},
 					Containers: []corev1.Container{
 						{
-							Name:            name,
-							Image:           "ghcr.io/getporter/porter:kubernetes-" + porterVersion,
+							Name:            jobName,
+							Image:           img,
 							ImagePullPolicy: pullPolicy,
 							Args:            args,
 							Env: []corev1.EnvVar{
@@ -161,6 +197,18 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, n
 								{
 									Name:  "IN_CLUSTER",
 									Value: "true",
+								},
+								{
+									Name:  "LABELS",
+									Value: "porter=true installation=" + inst.Name,
+								},
+								{
+									Name:  "OUTPUTS_PVC",
+									Value: pvc.Name,
+								},
+								{
+									Name:  "CLEANUP_JOBS",
+									Value: "false",
 								},
 							},
 							EnvFrom: []corev1.EnvFromSource{
@@ -190,8 +238,37 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, n
 		},
 	}
 
-	err := r.Create(ctx, porterJob, &client.CreateOptions{})
+	err = r.Create(ctx, porterJob, &client.CreateOptions{})
 	return errors.Wrapf(err, "error creating job for Installation %s/%s@%s", inst.Namespace, inst.Name, inst.ResourceVersion)
+}
+
+// TODO: Consolidate all of this into a single config struct
+func (r *InstallationReconciler) getOutputsVolumeSize(ctx context.Context, inst *porterv1.Installation) (resource.Quantity, error) {
+	outputsVolumeSize := "128Mi"
+	if inst.Spec.OutputsVolumeSize != "" {
+		r.Log.Info(fmt.Sprintf("bundle outputs volume size override: %s", inst.Spec.OutputsVolumeSize))
+		// Use the quantity specified by the instance
+		outputsVolumeSize = inst.Spec.OutputsVolumeSize
+	} else {
+		// Check if the namespace has a default configured
+		cfg := &corev1.ConfigMap{}
+		err := r.Get(ctx, types.NamespacedName{Name: "porter", Namespace: inst.Namespace}, cfg)
+		if err != nil {
+			r.Log.Info(fmt.Sprintf("WARN: cannot retrieve porter configmap %q, using default configuration", err))
+		}
+		if v, ok := cfg.Data["outputsVolumeSize"]; ok {
+			r.Log.Info(fmt.Sprintf("bundle outputs volume size defaulted from configmap to %s", v))
+			outputsVolumeSize = v
+		}
+	}
+
+	qty, err := resource.ParseQuantity(outputsVolumeSize)
+	if err != nil {
+		return resource.Quantity{}, errors.Wrapf(err, "invalid outputsVolumeSize %s", outputsVolumeSize)
+	}
+
+	r.Log.Info("resolved bundle outputs volume size", "outputsVolumeSize", qty)
+	return qty, nil
 }
 
 func (r *InstallationReconciler) getPorterImageVersion(ctx context.Context, inst *porterv1.Installation) (porterVersion string, pullPolicy corev1.PullPolicy) {

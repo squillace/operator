@@ -33,6 +33,9 @@ type InstallationSpec struct {
 
 	// Parameters is a list of parameter set names.
 	Parameters []string `json:"parameters,omitempty"`
+
+	// OutputsVolumeSize is the size of the PersistentVolume to use for storing the bundle outputs. Defaults to 128Mi.
+	OutputsVolumeSize string `json:"outputsVolumeSize,omitempty"`
 }
 
 // InstallationStatus defines the observed state of Installation

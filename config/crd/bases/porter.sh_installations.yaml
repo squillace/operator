@@ -46,6 +46,10 @@ spec:
                 items:
                   type: string
                 type: array
+              outputsVolumeSize:
+                description: OutputsVolumeSize is the size of the PersistentVolume
+                  to use for storing the bundle outputs. Defaults to 128Mi.
+                type: string
               parameters:
                 description: Parameters is a list of parameter set names.
                 items:
