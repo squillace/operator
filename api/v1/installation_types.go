@@ -28,11 +28,14 @@ type InstallationSpec struct {
 
 	// TODO: Force pull, debug and other flags
 
-	// Credentials is a list of credential set names.
-	Credentials []string `json:"credentials,omitempty"`
+	// CredentialSets is a list of credential set names.
+	CredentialSets []string `json:"credentialSets,omitempty"`
+
+	// ParameterSets is a list of parameter set names.
+	ParameterSets []string `json:"parameterSets,omitempty"`
 
 	// Parameters is a list of parameter set names.
-	Parameters []string `json:"parameters,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 
 	// OutputsVolumeSize is the size of the PersistentVolume to use for storing the bundle outputs. Defaults to 128Mi.
 	OutputsVolumeSize string `json:"outputsVolumeSize,omitempty"`

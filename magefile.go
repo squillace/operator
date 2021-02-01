@@ -29,10 +29,13 @@ import (
 // var Default = Build
 
 const (
-	kindVersion     = "v0.9.0"
-	kindClusterName = "porter"
-	namespace       = "porter-operator-system"
-	kubeconfig      = "kind.config"
+	kindVersion       = "v0.9.0"
+	kindClusterName   = "porter"
+	operatorNamespace = "porter-operator-system"
+
+	// Namespace where you can do manual testing
+	testNamespace = "test"
+	kubeconfig    = "kind.config"
 )
 
 // Install mage if necessary.
@@ -58,13 +61,13 @@ func Deploy() error {
 		return err
 	}
 
-	return kubectl("rollout", "restart", "deployment/porter-operator-controller-manager", "--namespace", namespace)
+	return kubectl("rollout", "restart", "deployment/porter-operator-controller-manager", "--namespace", operatorNamespace)
 }
 
 func Bump(sample string) error {
-	mg.Deps(EnsureCluster, EnsureYq)
+	mg.Deps(EnsureTestNamespace, EnsureYq)
 
-	data, err := kubectlCmd("get", "installation.porter.sh", sample, "-o", "yaml").OutputE()
+	data, err := kubectlCmd("get", "installation.porter.sh", sample, "-o", "yaml").OutputS()
 	dataB := []byte(data)
 	if err != nil {
 		dataB, err = ioutil.ReadFile(fmt.Sprintf("config/samples/%s.yaml", sample))
@@ -101,18 +104,100 @@ func Bump(sample string) error {
 	return cmd.RunV()
 }
 
+func EnsureTestNamespace() error {
+	if namespaceExists(testNamespace) {
+		return nil
+	}
+
+	return setupTestNamespace()
+}
+
+func setupTestNamespace() error {
+	return SetupNamespace(testNamespace)
+}
+
+func namespaceExists(name string) bool {
+	err := kubectlCmd("get", "namespace", name).RunS()
+	return err == nil
+}
+
+// Create a namespace and configure it to work with the operator
+func SetupNamespace(name string) error {
+	mg.Deps(EnsureCluster)
+
+	if namespaceExists(name) {
+		err := kubectlCmd("delete", "ns", name, "--wait=true").RunS()
+		if err != nil {
+			return errors.Wrapf(err, "could not delete namespace %s", name)
+		}
+	}
+
+	err := kubectlCmd("create", "namespace", name).RunE()
+	if err != nil {
+		return errors.Wrapf(err, "could not create namespace %s", name)
+	}
+
+	err = kubectlCmd("label", "namespace", name, "porter-test=true").RunE()
+	if err != nil {
+		return errors.Wrapf(err, "could not label namespace %s", name)
+	}
+
+	err = kubectlCmd("create", "configmap", "porter", "--namespace", name,
+		"--from-literal=porterVersion=canary",
+		"--from-literal=serviceAccount=porter-agent",
+		"--from-literal=outputsVolumeSize=64Mi").RunE()
+	if err != nil {
+		return errors.Wrap(err, "could not create porter configmap")
+	}
+
+	err = kubectlCmd("create", "secret", "generic", "porter-config", "--namespace", name,
+		"--from-file=config.toml=hack/porter-config.toml").RunE()
+	if err != nil {
+		return errors.Wrap(err, "could not create porter-config secret")
+	}
+
+	err = kubectlCmd("create", "secret", "generic", "porter-env", "--namespace", name,
+		"--from-literal=AZURE_STORAGE_CONNECTION_STRING="+os.Getenv("PORTER_TEST_AZURE_STORAGE_CONNECTION_STRING"),
+		"--from-literal=AZURE_CLIENT_SECRET="+os.Getenv("PORTER_AZURE_CLIENT_SECRET"),
+		"--from-literal=AZURE_CLIENT_ID="+os.Getenv("PORTER_AZURE_CLIENT_ID"),
+		"--from-literal=AZURE_TENANT_ID="+os.Getenv("PORTER_AZURE_TENANT_ID")).RunE()
+	if err != nil {
+		return errors.Wrap(err, "could not create porter-env secret")
+	}
+
+	err = kubectlCmd("create", "serviceaccount", "porter-agent", "--namespace", name).RunE()
+	if err != nil {
+		return errors.Wrapf(err, "could not create porter-agent service account in %s", name)
+	}
+
+	err = kubectlCmd("create", "rolebinding", "porter-agent",
+		"--clusterrole", "porter-operator-agent-role",
+		"--serviceaccount", name+":porter-agent",
+		"--namespace", name).RunE()
+	if err != nil {
+		return errors.Wrapf(err, "could not create porter-agent service account in %s", name)
+	}
+
+	return setClusterNamespace(name)
+}
+
 func Clean() error {
-	// Remove manual runs
-	err := kubectl("delete", "jobs", "-l", "porter=true")
+	// Remove test runs
+	err := kubectl("delete", "ns", "-l", "porter-test=true")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
 	}
 
-	// Remove test runs
-	err = kubectl("delete", "ns", "-l", "porter-test=true")
+	// Remove manual runs
+	err = kubectl("delete", "jobs", "-l", "porter=true")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
 	}
+	err = kubectl("delete", "secrets", "-l", "porter=true")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -131,7 +216,7 @@ func PublishAgent() error {
 func Logs() error {
 	mg.Deps(EnsureKubectl)
 
-	return kubectl("logs", "-f", "deployment/porter-operator-controller-manager", "-c=manager", "--namespace", namespace)
+	return kubectl("logs", "-f", "deployment/porter-operator-controller-manager", "-c=manager", "--namespace", operatorNamespace)
 }
 
 // Install the operator-sdk if necessary
@@ -167,11 +252,11 @@ func EnsureCluster() error {
 	if err != nil {
 		errors.Wrapf(err, "error writing %s", kubeconfig)
 	}
-	return setClusterNamespace()
+	return setClusterNamespace(operatorNamespace)
 }
 
-func setClusterNamespace() error {
-	return shx.RunV("kubectl", "config", "set-context", "--current", "--namespace", "porter-operator-system")
+func setClusterNamespace(name string) error {
+	return shx.RunE("kubectl", "config", "set-context", "--current", "--namespace", name)
 }
 
 // Create a KIND cluster named porter.
@@ -215,7 +300,7 @@ networking:
 		errors.Wrap(err, "could not create KIND cluster")
 	}
 
-	err = setClusterNamespace()
+	err = setClusterNamespace(operatorNamespace)
 	if err != nil {
 		return err
 	}

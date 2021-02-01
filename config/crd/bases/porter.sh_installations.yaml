@@ -41,8 +41,8 @@ spec:
                   Porter will run an install if the installation does not exist, or
                   an upgrade otherwise.
                 type: string
-              credentials:
-                description: Credentials is a list of credential set names.
+              credentialSets:
+                description: CredentialSets is a list of credential set names.
                 items:
                   type: string
                 type: array
@@ -50,11 +50,16 @@ spec:
                 description: OutputsVolumeSize is the size of the PersistentVolume
                   to use for storing the bundle outputs. Defaults to 128Mi.
                 type: string
-              parameters:
-                description: Parameters is a list of parameter set names.
+              parameterSets:
+                description: ParameterSets is a list of parameter set names.
                 items:
                   type: string
                 type: array
+              parameters:
+                additionalProperties:
+                  type: string
+                description: Parameters is a list of parameter set names.
+                type: object
               porterVersion:
                 description: PorterVersion is the version of the Porter CLI to use
                   when executing the bundle. Defaults to "latest"

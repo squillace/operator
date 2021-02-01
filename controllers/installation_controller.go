@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	porterv1 "get.porter.sh/operator/api/v1"
+	"get.porter.sh/porter/pkg/manifest"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	batchv1 "k8s.io/api/batch/v1"
@@ -16,8 +18,6 @@ import (
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	porterv1 "get.porter.sh/operator/api/v1"
 )
 
 // InstallationReconciler reconciles a Installation object
@@ -51,7 +51,7 @@ func (r *InstallationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	err := r.Get(ctx, req.NamespacedName, inst)
 	if err != nil {
 		// TODO: cleanup deleted installations
-		r.Log.Info("Installation has been deleted", "installation %s/%s", req.Namespace, req.Name)
+		r.Log.Info("Installation has been deleted", "installation", fmt.Sprintf("%s/%s", req.Namespace, req.Name))
 		return ctrl.Result{Requeue: false}, nil
 	}
 
@@ -88,7 +88,7 @@ func (r *InstallationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, jobName string, inst *porterv1.Installation) error {
 	r.Log.Info(fmt.Sprintf("creating porter job %s/%s for Installation %s/%s", inst.Namespace, jobName, inst.Namespace, inst.Name))
 
-	// Create a volume to store bundle outputs
+	// Create a volume to share data between porter and the invocation image
 	outputsReq, err := r.getOutputsVolumeSize(ctx, inst)
 	if err != nil {
 		return err
@@ -125,19 +125,28 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, j
 
 	// porter ACTION INSTALLATION_NAME --tag=REFERENCE --debug
 	// TODO: For now require the action, and when porter supports installorupgrade switch
-	args := []string{
-		inst.Spec.Action,
+	var args []string
+	if manifest.IsCoreAction(inst.Spec.Action) {
+		args = append(args, inst.Spec.Action)
+	} else {
+		args = append(args, "invoke", "--action="+inst.Spec.Action)
+	}
+
+	args = append(args,
 		inst.Name,
-		"--reference=" + inst.Spec.Reference,
+		"--reference="+inst.Spec.Reference,
 		"--debug",
 		"--debug-plugins",
-		"--driver=kubernetes",
+		"--driver=kubernetes")
+
+	for _, c := range inst.Spec.CredentialSets {
+		args = append(args, "-c="+c)
 	}
-	for _, c := range inst.Spec.Credentials {
-		args = append(args, "--cred="+c)
+	for _, p := range inst.Spec.ParameterSets {
+		args = append(args, "-p="+p)
 	}
-	for _, p := range inst.Spec.Parameters {
-		args = append(args, "--param="+p)
+	for k, v := range inst.Spec.Parameters {
+		args = append(args, fmt.Sprintf("--param=%s=%s", k, v))
 	}
 
 	porterJob := &batchv1.Job{
@@ -173,6 +182,14 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, j
 				Spec: corev1.PodSpec{
 					Volumes: []corev1.Volume{
 						{
+							Name: "porter-shared",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvc.Name,
+								},
+							},
+						},
+						{
 							Name: "porter-config",
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
@@ -203,8 +220,12 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, j
 									Value: "porter=true installation=" + inst.Name,
 								},
 								{
-									Name:  "OUTPUTS_PVC",
+									Name:  "JOB_VOLUME_NAME",
 									Value: pvc.Name,
+								},
+								{
+									Name:  "JOB_VOLUME_PATH",
+									Value: "/porter-shared",
 								},
 								{
 									Name:  "CLEANUP_JOBS",
@@ -224,8 +245,12 @@ func (r *InstallationReconciler) createJobForInstallation(ctx context.Context, j
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
+									Name:      "porter-shared",
+									MountPath: "/porter-shared",
+								},
+								{
 									Name:      "porter-config",
-									MountPath: "/porter-config/",
+									MountPath: "/porter-config",
 								},
 							},
 						},
